@@ -14,6 +14,8 @@
 #  먼저 실행한 뒤 `python main.py`로 채점합니다.)
 
 import os
+from typing import NamedTuple
+
 import numpy as np
 import pandas as pd
 
@@ -22,7 +24,13 @@ TRAIN_FILE = os.path.join(DATA_DIR, "ratings_train.csv")
 VAL_FILE = os.path.join(DATA_DIR, "ratings_val.csv")   # 성능 확인용. 학습(fit)에는 사용하지 말 것
 INPUT_FILE = "input.txt"     # 한 줄에 "user_id,movie_id"
 OUTPUT_FILE = "output.txt"
+TOPK = 400
 
+# Task 3 하이퍼파라미터. train 내부 10% 홀드아웃으로 탐색해 확정 (ratings_val.csv 미사용)
+BIAS_REG, BIAS_ITERS = 3.0, 15
+MF_K, MF_LR, MF_REG, MF_EPOCHS, MF_BATCH, MF_SEED = 10, 0.01, 0.1, 60, 4096, 42
+BLEND_CF = 0.2                       # optimized = (1 - w) * MF + w * user_based_cf
+RATING_MIN, RATING_MAX = 0.5, 5.0
 
 # read input.txt : 한 줄에 "user_id,movie_id"
 def read_input():
@@ -46,34 +54,222 @@ def write_output(pairs, pred_user_based, pred_mf, pred_optimized):
             f.write("{},{},{:.4f}\n".format(uid, mid, s2))
             f.write("{},{},{:.4f}\n".format(uid, mid, s3))
 
+# ---------------- 데이터 레이어 ----------------
+
+class Dataset(NamedTuple):
+    R: np.ndarray            # (n_users, n_items) 평점. 미평가 칸은 0
+    C: np.ndarray            # (n_users, n_items) 평가 여부 마스크 0/1
+    D: np.ndarray            # (n_users, n_items) user 전체 평균으로 센터링. 미평가 칸은 0
+    user_mean: np.ndarray    # (n_users,) 평가한 항목만으로 낸 user 평균
+    item_mean: np.ndarray    # (n_items,) 평가한 user만으로 낸 movie 평균
+    global_mean: float
+    uid2idx: dict            # raw user_id -> 행 인덱스
+    mid2idx: dict            # raw movie_id -> 열 인덱스
+
+
+def build_dataset(train_df):
+    """train_df를 [# unique users, # unique movies] 밀집 행렬과 부수 통계로 변환.
+    user_id/movie_id가 희소하므로 raw id 대신 0-base 인덱스로 매핑한다."""
+    uids = np.sort(train_df["user_id"].unique())
+    mids = np.sort(train_df["movie_id"].unique())
+    uid2idx = {int(u): i for i, u in enumerate(uids)}
+    mid2idx = {int(m): i for i, m in enumerate(mids)}
+
+    rows = train_df["user_id"].map(uid2idx).to_numpy()
+    cols = train_df["movie_id"].map(mid2idx).to_numpy()
+    vals = train_df["rating"].to_numpy(dtype=np.float64)
+
+    R = np.zeros((len(uids), len(mids)), dtype=np.float64)
+    C = np.zeros((len(uids), len(mids)), dtype=np.float64)
+    R[rows, cols] = vals
+    C[rows, cols] = 1.0
+
+    global_mean = float(vals.mean())
+    user_mean = R.sum(axis=1) / C.sum(axis=1)   # train user는 최소 6개 평가 -> 0 나눗셈 없음
+    item_cnt = C.sum(axis=0)
+    item_mean = np.divide(R.sum(axis=0), item_cnt,
+                          out=np.full(len(mids), global_mean, dtype=np.float64),
+                          where=item_cnt > 0)
+
+    # 미평가 칸 0 -> I_uv 제한이 행렬곱으로 자동 처리됨
+    D = (R - user_mean[:, None]) * C
+
+    return Dataset(R, C, D, user_mean, item_mean, global_mean, uid2idx, mid2idx)
+
+
+def cold_start_fallback(ds, u, m):
+    """train에 없는 user/movie 폴백. 어떤 입력에도 유한한 값을 내야 한다."""
+    if m is not None:
+        return float(ds.item_mean[m])    # cold user  -> 해당 movie 평균
+    if u is not None:
+        return float(ds.user_mean[u])    # cold movie -> 해당 user 평균
+    return ds.global_mean                # 둘 다 cold
+
 
 #### TODO: 아래 함수들을 실제 구현으로 교체하세요 ####
 
-def user_based_cf(train_df, pairs):
-    # Task 1: user-item sparse matrix + Pearson Correlation 기반 User-based CF
-    # test implementation — 항상 3.5점으로 예측
-    return [3.5 for _ in pairs]
+def pearson_similarity(ds):
+    """공통 평가 항목 I_uv 기준 Pearson 유사도 행렬 (n_users, n_users).
+    r_u_bar는 공통 항목이 아닌 user 전체 평균. 분모의 두 합도 I_uv로 제한된다."""
+    num = ds.D @ ds.D.T                  # sum_{i in I_uv} (r_ui - r_u_bar)(r_vi - r_v_bar)
+    A = (ds.D ** 2) @ ds.C.T             # A[u, v] = sum_{i in I_uv} (r_ui - r_u_bar)^2
+    den = np.sqrt(A * A.T)               # A.T[u, v] = A[v, u] = sum_{i in I_uv} (r_vi - r_v_bar)^2
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        S = np.where(den > 0, num / den, 0.0)   # 공통 항목 없음/분산 0 -> 유사도 0
+    np.fill_diagonal(S, 0.0)             # 예측 시 v != u 조건을 자동 충족
+    return S
 
 
-def matrix_factorization(train_df, pairs):
-    # Task 2: user-item sparse matrix를 SVD로 분해 (K=400) 후 예측
-    # test implementation — 항상 3.5점으로 예측
-    return [3.5 for _ in pairs]
+def user_based_cf(ds, pairs):
+    """Task 1: r_ui_hat = r_u_bar + sum_v s(u,v)(r_vi - r_v_bar) / sum_v |s(u,v)|.
+    분모는 반드시 절댓값 합. 부호 있는 합은 0 근처에서 발산한다."""
+    S = pearson_similarity(ds)
+    abs_S = np.abs(S)
+
+    predictions = []
+    for user_id, movie_id in pairs:
+        u = ds.uid2idx.get(int(user_id))
+        m = ds.mid2idx.get(int(movie_id))
+        if u is None or m is None:
+            predictions.append(cold_start_fallback(ds, u, m))
+            continue
+
+        # i 미평가 v는 D=0/C=0이라 자동 제외
+        numerator = float(S[u] @ ds.D[:, m])
+        denominator = float(abs_S[u] @ ds.C[:, m])
+
+        if denominator > 0:
+            predictions.append(float(ds.user_mean[u]) + numerator / denominator)
+        else:
+            # 모든 유사도 0 -> 아이템 평균 평점 (명세 명시)
+            predictions.append(float(ds.item_mean[m]))
+
+    return predictions
 
 
-def optimized(train_df, pairs):
-    # Task 3: Task 1 또는 Task 2를 기반으로 한 최적화 버전
-    # test implementation — 항상 3.5점으로 예측
-    return [3.5 for _ in pairs]
+def matrix_factorization(ds, pairs):
+    """Task 2: 빈칸을 item 평균으로 채운 뒤 SVD로 분해(K=400)해 복원.
+    0으로 채우면 모델이 0 쪽으로 학습된다."""
+    F = ds.R * ds.C + ds.item_mean[None, :] * (1 - ds.C)
+    U, s, Vt = np.linalg.svd(F, full_matrices=False)
+
+    k = min(TOPK, len(s))                # full_matrices=False -> len(s) = n_users = 547
+    user_factors = U[:, :k] * s[:k]
+    item_factors = Vt[:k, :]
+    P = user_factors @ item_factors
+    
+    predictions = []
+    for user_id, movie_id in pairs:
+        u = ds.uid2idx.get(int(user_id))
+        m = ds.mid2idx.get(int(movie_id))
+        if u is None or m is None:
+            predictions.append(cold_start_fallback(ds, u, m))
+            continue
+        predictions.append(float(P[u, m]))
+
+    return predictions
+
+
+def observed_entries(ds):
+    """관측된 (user, item, rating)만 1차원 배열로. 결측 대치 없이 학습하기 위함."""
+    rows, cols = np.nonzero(ds.C)
+    return rows, cols, ds.R[rows, cols]
+
+
+def fit_baseline(ds):
+    """mu + b_u + b_i 를 ALS closed-form으로 교대 추정. bincount라 완전 벡터화."""
+    rows, cols, vals = observed_entries(ds)
+    n_users, n_items = ds.R.shape
+    mu = ds.global_mean
+    bu = np.zeros(n_users)
+    bi = np.zeros(n_items)
+    user_cnt = np.bincount(rows, minlength=n_users)
+    item_cnt = np.bincount(cols, minlength=n_items)
+
+    for _ in range(BIAS_ITERS):
+        bu = np.bincount(rows, vals - mu - bi[cols], n_users) / (user_cnt + BIAS_REG)
+        bi = np.bincount(cols, vals - mu - bu[rows], n_items) / (item_cnt + BIAS_REG)
+    return mu, bu, bi
+
+
+def fit_latent_factors(ds, mu, bu, bi):
+    """baseline 잔차에 minibatch SGD로 p_u, q_i 학습. 관측치에만 손실을 건다."""
+    rows, cols, vals = observed_entries(ds)
+    resid = vals - (mu + bu[rows] + bi[cols])
+    n_users, n_items = ds.R.shape
+
+    rng = np.random.default_rng(MF_SEED)
+    P = rng.normal(0, 0.1, (n_users, MF_K))
+    Q = rng.normal(0, 0.1, (n_items, MF_K))
+    order = np.arange(len(vals))
+
+    for _ in range(MF_EPOCHS):
+        rng.shuffle(order)
+        for start in range(0, len(order), MF_BATCH):
+            idx = order[start:start + MF_BATCH]
+            u, i = rows[idx], cols[idx]
+            pu, qi = P[u], Q[i]
+            err = (resid[idx] - np.einsum("ij,ij->i", pu, qi))[:, None]
+            # 같은 u/i가 배치 안에서 겹치면 add.at이 누적 적용 (Hogwild 식 허용)
+            np.add.at(P, u, MF_LR * (err * qi - MF_REG * pu))
+            np.add.at(Q, i, MF_LR * (err * pu - MF_REG * qi))
+    return P, Q
+
+
+def optimized(ds, pairs):
+    """Task 3: Task 2 개선. 결측 대치 대신 관측치에만 손실을 거는 baseline + biased MF.
+    user-based CF와 블렌딩 후 평점 범위로 clip."""
+    mu, bu, bi = fit_baseline(ds)
+    P, Q = fit_latent_factors(ds, mu, bu, bi)
+
+    mf_pred = np.empty(len(pairs))
+    for t, (user_id, movie_id) in enumerate(pairs):
+        u = ds.uid2idx.get(int(user_id))
+        m = ds.mid2idx.get(int(movie_id))
+        if u is None or m is None:
+            mf_pred[t] = cold_start_fallback(ds, u, m)
+        else:
+            mf_pred[t] = mu + bu[u] + bi[m] + P[u] @ Q[m]
+
+    cf_pred = np.array(user_based_cf(ds, pairs))
+    blended = (1.0 - BLEND_CF) * mf_pred + BLEND_CF * cf_pred
+    return list(np.clip(blended, RATING_MIN, RATING_MAX))
 
 #### TODO end ####
 
+def rmse(y_true, y_pred):
+    return np.sqrt(np.mean((np.array(y_true) - np.array(y_pred)) ** 2))
 
-train_df = pd.read_csv(TRAIN_FILE)
-pairs = read_input()
+if __name__ == "__main__":
+    # 개발용 검증 경로. 제출 전 read_input()/write_output() 경로로 교체할 것
+    # ratings_val.csv는 성능 확인 전용, 학습에 사용 금지
+    train_df = pd.read_csv(TRAIN_FILE)
+    val_df = pd.read_csv(VAL_FILE)
 
-pred_user_based = user_based_cf(train_df, pairs)
-pred_mf = matrix_factorization(train_df, pairs)
-pred_optimized = optimized(train_df, pairs)
+    ds = build_dataset(train_df)
+    print("matrix {} x {}, density {:.2%}".format(
+        ds.R.shape[0], ds.R.shape[1], ds.C.sum() / ds.C.size))
 
-write_output(pairs, pred_user_based, pred_mf, pred_optimized)
+    # train에 없는 user/movie는 명세상 제외 -> warm 행만 평가
+    warm = val_df[val_df["user_id"].isin(ds.uid2idx) & val_df["movie_id"].isin(ds.mid2idx)]
+    warm_pairs = list(zip(warm["user_id"], warm["movie_id"]))
+    warm_true = warm["rating"].to_numpy()
+
+    # 명세의 per-user 검증 기준 (Task1, Task2)
+    thresholds = {
+        "Task1 user-based": (user_based_cf, {199: 0.65, 458: 0.75, 529: 0.75}),
+        "Task2 SVD K={}".format(TOPK): (matrix_factorization, {199: 0.60, 458: 0.70, 529: 0.75}),
+        "Task3 optimized": (optimized, {199: None, 458: None, 529: None}),
+    }
+    for label, (fn, thr) in thresholds.items():
+        pred = np.array(fn(ds, warm_pairs))
+        print("{}: warm RMSE {:.4f}  (n={})".format(label, rmse(warm_true, pred), len(warm)))
+        for user_id, limit in thr.items():
+            mask = warm["user_id"].to_numpy() == user_id
+            score = rmse(warm_true[mask], pred[mask])
+            if limit is None:
+                print("  user {:>3}: RMSE {:.4f}".format(user_id, score))
+            else:
+                print("  user {:>3}: RMSE {:.4f}  (limit <{:.2f})  {}".format(
+                    user_id, score, limit, "OK" if score < limit else "MISS"))
