@@ -1,5 +1,5 @@
 # Project 2: Neighborhood-based / Model-Based Recommendation
-# 2026-00000 홍길동
+# 2025-27567 배문성
 #
 # 제출: main.py (+ 필요시 requirements.txt)
 # 채점: `python main.py` 로 input.txt를 읽어 output.txt를 생성합니다.
@@ -19,28 +19,35 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-DATA_DIR = "data"
+# input.txt / output.txt / data/ 는 main.py와 같은 위치 기준 (실행 위치와 무관)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 TRAIN_FILE = os.path.join(DATA_DIR, "ratings_train.csv")
 VAL_FILE = os.path.join(DATA_DIR, "ratings_val.csv")   # 성능 확인용. 학습(fit)에는 사용하지 말 것
-INPUT_FILE = "input.txt"     # 한 줄에 "user_id,movie_id"
-OUTPUT_FILE = "output.txt"
+INPUT_FILE = os.path.join(BASE_DIR, "input.txt")     # 한 줄에 "user_id,movie_id"
+OUTPUT_FILE = os.path.join(BASE_DIR, "output.txt")
 TOPK = 400
 
-# Task 3 하이퍼파라미터. train 내부 10% 홀드아웃으로 탐색해 확정 (ratings_val.csv 미사용)
+# Task 3 하이퍼파라미터. train 내부 10% 홀드아웃에서 seed 0~4 평균 RMSE로 탐색해 확정
+# (ratings_val.csv 미사용)
 BIAS_REG, BIAS_ITERS = 3.0, 15
-MF_K, MF_LR, MF_REG, MF_EPOCHS, MF_BATCH, MF_SEED = 10, 0.01, 0.1, 60, 4096, 42
+MF_K, MF_LR, MF_REG, MF_EPOCHS, MF_BATCH, MF_SEED = 100, 0.01, 0.1, 60, 4096, 42
 BLEND_CF = 0.2                       # optimized = (1 - w) * MF + w * user_based_cf
 RATING_MIN, RATING_MAX = 0.5, 5.0
 
 # read input.txt : 한 줄에 "user_id,movie_id"
+# BOM, 필드 앞뒤 공백, "user_id,movie_id" 헤더나 주석 줄이 섞여 있어도 죽지 않게 한다
 def read_input():
     pairs = []
-    with open(INPUT_FILE, "r") as f:
+    with open(INPUT_FILE, "r", encoding="utf-8-sig") as f:
         for l in f.readlines():
             l = l.strip()
-            if not l:
+            if not l or l.startswith("#"):
                 continue
-            uid, mid = l.split(",")
+            fields = [x.strip() for x in l.split(",")]
+            if len(fields) < 2 or not (fields[0].isdigit() and fields[1].isdigit()):
+                continue
+            uid, mid = fields[0], fields[1]
             pairs.append((uid, mid))
     return pairs
 
@@ -48,7 +55,7 @@ def read_input():
 # pairs와 세 task의 prediction 리스트(각각 같은 길이/순서)를 받아
 # 각 pair마다 "user_id,movie_id,prediction_score" 3줄(User-based/MF/Optimized 순)을 씀
 def write_output(pairs, pred_user_based, pred_mf, pred_optimized):
-    with open(OUTPUT_FILE, "w") as f:
+    with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
         for (uid, mid), s1, s2, s3 in zip(pairs, pred_user_based, pred_mf, pred_optimized):
             f.write("{},{},{:.4f}\n".format(uid, mid, s1))
             f.write("{},{},{:.4f}\n".format(uid, mid, s2))
@@ -238,38 +245,15 @@ def optimized(ds, pairs):
 
 #### TODO end ####
 
-def rmse(y_true, y_pred):
-    return np.sqrt(np.mean((np.array(y_true) - np.array(y_pred)) ** 2))
 
 if __name__ == "__main__":
-    # 개발용 검증 경로. 제출 전 read_input()/write_output() 경로로 교체할 것
-    # ratings_val.csv는 성능 확인 전용, 학습에 사용 금지
+    # 학습은 ratings_train.csv만 사용. ratings_val.csv 기반 성능 확인은 eval.py (제출 X)
     train_df = pd.read_csv(TRAIN_FILE)
-    val_df = pd.read_csv(VAL_FILE)
-
+    pairs = read_input()
     ds = build_dataset(train_df)
-    print("matrix {} x {}, density {:.2%}".format(
-        ds.R.shape[0], ds.R.shape[1], ds.C.sum() / ds.C.size))
 
-    # train에 없는 user/movie는 명세상 제외 -> warm 행만 평가
-    warm = val_df[val_df["user_id"].isin(ds.uid2idx) & val_df["movie_id"].isin(ds.mid2idx)]
-    warm_pairs = list(zip(warm["user_id"], warm["movie_id"]))
-    warm_true = warm["rating"].to_numpy()
+    pred_user_based = user_based_cf(ds, pairs)
+    pred_mf = matrix_factorization(ds, pairs)
+    pred_optimized = optimized(ds, pairs)
 
-    # 명세의 per-user 검증 기준 (Task1, Task2)
-    thresholds = {
-        "Task1 user-based": (user_based_cf, {199: 0.65, 458: 0.75, 529: 0.75}),
-        "Task2 SVD K={}".format(TOPK): (matrix_factorization, {199: 0.60, 458: 0.70, 529: 0.75}),
-        "Task3 optimized": (optimized, {199: None, 458: None, 529: None}),
-    }
-    for label, (fn, thr) in thresholds.items():
-        pred = np.array(fn(ds, warm_pairs))
-        print("{}: warm RMSE {:.4f}  (n={})".format(label, rmse(warm_true, pred), len(warm)))
-        for user_id, limit in thr.items():
-            mask = warm["user_id"].to_numpy() == user_id
-            score = rmse(warm_true[mask], pred[mask])
-            if limit is None:
-                print("  user {:>3}: RMSE {:.4f}".format(user_id, score))
-            else:
-                print("  user {:>3}: RMSE {:.4f}  (limit <{:.2f})  {}".format(
-                    user_id, score, limit, "OK" if score < limit else "MISS"))
+    write_output(pairs, pred_user_based, pred_mf, pred_optimized)
